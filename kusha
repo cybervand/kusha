@@ -1,0 +1,23 @@
+
+-------------------------------------------------------------------------------
+   ROBOCOPY     ::     Robust File Copy for Windows                              
+-------------------------------------------------------------------------------
+
+  Started : Thursday, March 12, 2026 9:45:07 AM
+   Source : C:\Users\PeterBjorvand\Documents\git\develop\kusha\
+     Dest : C:\Users\PeterBjorvand\Documents\git\push\kusha.git\
+
+    Files : *.*
+	    
+ Exc Dirs : .git
+	    node_modules
+	    
+  Options : *.* /S /E /DCOPY:DA /COPY:DAT /R:1000000 /W:30 
+
+------------------------------------------------------------------------------
+
+	                   8	C:\Users\PeterBjorvand\Documents\git\develop\kusha\
+	  *EXTRA File 		   35823	LICENSE
+	    New File  		     754	docker-compose.yml 87%  100%  
+	    New File  		     774	Dockerfile 88%  100%  
+	    New File  		       0	kusha

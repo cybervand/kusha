@@ -1,0 +1,4 @@
+fastapi>=0.120.0
+uvicorn>=0.38.0
+pydantic>=2.3
+pyserial>=3.5

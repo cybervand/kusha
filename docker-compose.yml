@@ -1,0 +1,32 @@
+services:
+  kusha:
+    build: .
+    image: kusha:1.0.2
+    container_name: kusha
+    restart: unless-stopped
+    group_add:
+      - dialout
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+    ports:
+      - "6969:6969"
+    volumes:
+      - kusha-data:/app/data
+    environment:
+      - SMS_API_KEY=${SMS_API_KEY:-}
+      # - SMS_DISABLE_SSL=true  # Uncomment for HTTP instead of HTTPS
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "--no-check-certificate", "https://127.0.0.1:6969/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  kusha-data:
+    name: kusha-data
