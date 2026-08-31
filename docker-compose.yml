@@ -1,9 +1,10 @@
 services:
   kusha:
     build: .
-    image: kusha:1.0.2
+    image: kusha:1.0.3
     container_name: kusha
     restart: unless-stopped
+    init: true  # tini as PID 1 reaps zombie children of uvicorn
     group_add:
       - dialout
     devices:

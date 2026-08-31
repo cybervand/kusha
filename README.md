@@ -1,8 +1,14 @@
-﻿# Kusha v1.0.2
+﻿# Kusha v1.0.3
 
 SMS Gateway API for iGate Prime GSM devices. Twin of Lava (SMS Web App).
 
 ## Version History
+
+### v1.0.3 - August 31, 2026
+- **No message history:** Kusha now retains nothing. Outgoing messages are never stored; incoming messages are deleted the moment `/sms/inbox` serves them (atomic claim-and-delete, fixes the concurrent-poll race that lost/duplicated messages). Pre-1.0.3 leftover rows are purged on startup. `GET /sms/messages` now only shows the transient unserved backlog.
+- **Inbox contract:** `/sms/inbox` messages now include `id` (stable dedup key) and `timestamp` (ISO 8601, taken from the modem's SCTS receive time when parseable, else UTC insert time).
+- **Zombie reaping:** `init: true` in docker-compose (tini as PID 1).
+- `/sms/inbox` has ONE consumer: Lava's server-side drain. Do not point anything else at it — with consume-on-read, a second reader steals messages.
 
 ### v1.0.2 - December 18, 2025
 - **Fixed:** `/sms/inbox` now returns all unread messages from database, not just newly fetched ones

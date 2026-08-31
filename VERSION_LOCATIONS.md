@@ -1,7 +1,7 @@
 # Version Locations Reference
 
 ## Current Version
-- **Version:** 1.0.2
+- **Version:** 1.0.3
 - **Name:** Kusha
 - **Twin App:** Lava (SMS Web App)
 

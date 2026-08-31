@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -18,7 +19,7 @@ from pydantic import BaseModel
 # App setup
 # ============================================================================
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 CODENAME = "Kusha"
 
 # ============================================================================
@@ -142,6 +143,10 @@ def init_db() -> None:
         )
         """
     )
+    # Kusha keeps no message history: the table only holds incoming
+    # messages that /sms/inbox has not served yet. Purge rows left over
+    # from pre-1.0.3 databases (outgoing copies and already-served rows).
+    cur.execute("DELETE FROM messages WHERE direction != 'in' OR unread = 0")
     con.commit()
     con.close()
 
@@ -192,8 +197,12 @@ class SMSMessage(BaseModel):
 
 
 class InboxMessage(BaseModel):
+    # Field names are the contract with Lava's ingestion (addReceived
+    # reads msg.id and msg.timestamp) - do not rename.
+    id: int
     number: str
     text: str
+    timestamp: str  # ISO 8601
 
 
 class InboxResponse(BaseModel):
@@ -210,10 +219,6 @@ serial_lock = threading.Lock()
 # Flag to pause the reader thread during send operations
 reader_paused = threading.Event()
 reader_paused.clear()  # Not paused by default
-
-# In-memory inbox for newly received messages (since last /sms/inbox)
-inbox: list[dict[str, str]] = []
-inbox_lock = threading.Lock()
 
 
 def _init_serial_locked() -> serial.Serial:
@@ -265,22 +270,49 @@ def get_serial() -> serial.Serial:
 # ============================================================================
 
 
-def _store_incoming_sms(number: str, text: str) -> None:
-    """Store incoming SMS in DB and in-memory inbox."""
-    msg = {"number": number, "text": text}
+def _parse_scts(date_part: str, time_part: str) -> str | None:
+    """
+    Convert a CMGL service-center timestamp to ISO 8601.
 
-    # Push to in-memory inbox
-    with inbox_lock:
-        inbox.append(msg)
+    The CMGL header is comma-split, so the SCTS arrives as two parts:
+    date_part like '"25/11/20' (yy/MM/dd) and time_part like
+    '01:11:57+04"', where the zone suffix counts quarter-hours.
+    Returns None if the format doesn't match (caller falls back to
+    CURRENT_TIMESTAMP).
+    """
+    try:
+        date_s = date_part.strip('" ')
+        time_s = time_part.strip('" ')
+        yy, mm, dd = (int(x) for x in date_s.split("/"))
+        m = re.match(r"^(\d{2}):(\d{2}):(\d{2})([+-]\d{2})?$", time_s)
+        if m is None or not (1 <= mm <= 12 and 1 <= dd <= 31):
+            return None
+        iso = f"20{yy:02d}-{mm:02d}-{dd:02d}T{m.group(1)}:{m.group(2)}:{m.group(3)}"
+        if m.group(4):
+            quarter_hours = int(m.group(4))
+            offset_min = abs(quarter_hours) * 15
+            sign = "-" if quarter_hours < 0 else "+"
+            iso += f"{sign}{offset_min // 60:02d}:{offset_min % 60:02d}"
+        return iso
+    except Exception:
+        return None
 
-    # Persist to DB
+
+def _store_incoming_sms(number: str, text: str, timestamp: str | None = None) -> None:
+    """Store an incoming SMS until /sms/inbox serves (and deletes) it."""
     try:
         con = get_db_connection()
         cur = con.cursor()
-        cur.execute(
-            "INSERT INTO messages (direction, number, text, unread) VALUES (?, ?, ?, ?)",
-            ("in", number, text, 1),
-        )
+        if timestamp:
+            cur.execute(
+                "INSERT INTO messages (direction, number, text, unread, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("in", number, text, 1, timestamp),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO messages (direction, number, text, unread) VALUES (?, ?, ?, ?)",
+                ("in", number, text, 1),
+            )
         con.commit()
         con.close()
         print(f"[INFO] Stored incoming SMS from {number!r}: {text!r}")
@@ -345,18 +377,20 @@ def fetch_unread_messages() -> None:
 
     current_index: int | None = None
     current_number: str = "unknown"
+    current_timestamp: str | None = None
     current_body_lines: list[str] = []
     found_indices: list[int] = []
 
     def flush_current() -> None:
-        nonlocal current_index, current_number, current_body_lines
+        nonlocal current_index, current_number, current_timestamp, current_body_lines
         if current_index is None:
             return
         text = "\n".join(current_body_lines).strip() or "(empty)"
-        _store_incoming_sms(current_number, text)
+        _store_incoming_sms(current_number, text, current_timestamp)
         found_indices.append(current_index)
         current_index = None
         current_number = "unknown"
+        current_timestamp = None
         current_body_lines = []
 
     for line in lines:
@@ -377,10 +411,18 @@ def fetch_unread_messages() -> None:
                     current_number = parts[2].strip('" ')
                 else:
                     current_number = "unknown"
+
+                # parts[4]/parts[5] = SCTS date and time (the timestamp
+                # itself contains a comma, so it spans two parts)
+                if len(parts) > 5:
+                    current_timestamp = _parse_scts(parts[4], parts[5])
+                else:
+                    current_timestamp = None
             except Exception as e:
                 print(f"[WARN] Failed to parse CMGL header: {line!r} ({e})")
                 current_index = None
                 current_number = "unknown"
+                current_timestamp = None
                 current_body_lines = []
         elif line == "OK":
             # "OK" could be part of the SMS body (e.g., iGate responding "OK")
@@ -602,19 +644,9 @@ def send_sms(payload: SMSRequest, _: bool = Depends(verify_api_key)) -> SMSSendR
                 else:
                     print(f"[INFO] SMS sent successfully to {payload.number}")
 
-        # Store outgoing SMS in DB
-        try:
-            con = get_db_connection()
-            cur = con.cursor()
-            cur.execute(
-                "INSERT INTO messages (direction, number, text, unread) VALUES (?, ?, ?, ?)",
-                ("out", payload.number, payload.text, 0),
-            )
-            con.commit()
-            con.close()
-        except Exception as db_e:
-            print(f"[DB ERROR] Failed to insert outgoing SMS: {db_e}")
-
+        # Outgoing messages are deliberately NOT stored: a compromised
+        # Kusha must hold no message history (they include the reception
+        # apps' visitor notifications, i.e. PII).
         print("[DEBUG] SMS send complete")
 
         return SMSSendResponse(
@@ -633,7 +665,13 @@ def send_sms(payload: SMSRequest, _: bool = Depends(verify_api_key)) -> SMSSendR
 
 @app.get("/sms/messages", response_model=List[SMSMessage])
 def list_messages(_: bool = Depends(verify_api_key)) -> List[SMSMessage]:
-    """Return all stored SMS messages (incoming + outgoing)."""
+    """
+    Return the transient backlog of not-yet-served incoming messages.
+
+    Kusha keeps no message history: outgoing messages are never stored,
+    and incoming rows are deleted the moment /sms/inbox serves them, so
+    this list is empty except between a modem fetch and the next drain.
+    """
     con = get_db_connection()
     cur = con.cursor()
     cur.execute("SELECT id, direction, number, text, unread FROM messages ORDER BY id DESC")
@@ -658,50 +696,61 @@ def list_messages(_: bool = Depends(verify_api_key)) -> List[SMSMessage]:
 @app.get("/sms/inbox", response_model=InboxResponse)
 def get_inbox(_: bool = Depends(verify_api_key)) -> InboxResponse:
     """
-    Fetch new messages from the modem and return all unread incoming messages.
-    
-    This checks the modem for new messages, then returns ALL unread incoming
-    messages from the database (not just newly fetched ones). This ensures
-    messages aren't lost if a previous fetch stored them but they weren't
-    delivered to a client.
+    Fetch new messages from the modem, then serve each stored incoming
+    message EXACTLY ONCE and delete it.
+
+    Consume-on-read is deliberate (a compromised Kusha holds no message
+    history), so this endpoint must have a single consumer: Lava's
+    server-side drain. The claim-and-delete runs in one immediate
+    transaction so concurrent callers can never receive the same row
+    twice or steal each other's rows mid-read.
     """
     # Fetch any new messages from modem first
     try:
         fetch_unread_messages()
     except Exception as e:
         print(f"[ERROR] Failed to fetch messages in get_inbox: {e}")
-    
-    # Clear the in-memory inbox (we'll use database instead)
-    with inbox_lock:
-        inbox.clear()
-    
-    # Get all unread incoming messages from database
-    messages = []
-    message_ids = []
+
+    messages: list[InboxMessage] = []
     try:
-        con = get_db_connection()
-        cur = con.cursor()
-        cur.execute(
-            "SELECT id, number, text FROM messages WHERE direction = 'in' AND unread = 1 ORDER BY id ASC"
-        )
-        rows = cur.fetchall()
-        
-        for row in rows:
-            msg_id, number, text = row
-            messages.append(InboxMessage(number=number, text=text))
-            message_ids.append(msg_id)
-        
-        # Mark these messages as read
-        if message_ids:
-            placeholders = ','.join('?' * len(message_ids))
-            cur.execute(f"UPDATE messages SET unread = 0 WHERE id IN ({placeholders})", message_ids)
-            con.commit()
-            print(f"[INFO] Returned and marked {len(message_ids)} messages as read")
-        
-        con.close()
+        # isolation_level=None: no implicit transactions, we manage the
+        # BEGIN IMMEDIATE/COMMIT pair ourselves.
+        con = sqlite3.connect(DB_PATH, isolation_level=None)
+        try:
+            cur = con.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                "SELECT id, number, text, created_at FROM messages WHERE direction = 'in' ORDER BY id ASC"
+            )
+            rows = cur.fetchall()
+            if rows:
+                placeholders = ",".join("?" * len(rows))
+                cur.execute(
+                    f"DELETE FROM messages WHERE id IN ({placeholders})",
+                    [r[0] for r in rows],
+                )
+            cur.execute("COMMIT")
+        finally:
+            con.close()
+
+        for msg_id, number, text, created_at in rows:
+            # created_at is either a parsed modem SCTS (already ISO) or
+            # sqlite's CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS', UTC)
+            if not created_at:
+                timestamp = ""
+            elif "T" in created_at:
+                timestamp = created_at
+            else:
+                timestamp = created_at.replace(" ", "T") + "Z"
+            messages.append(
+                InboxMessage(id=msg_id, number=number, text=text, timestamp=timestamp)
+            )
+
+        if rows:
+            print(f"[INFO] Served and deleted {len(rows)} inbox messages")
     except Exception as e:
-        print(f"[DB ERROR] Failed to get unread messages: {e}")
-    
+        print(f"[DB ERROR] Failed to drain inbox: {e}")
+
     return InboxResponse(messages=messages)
 
 
